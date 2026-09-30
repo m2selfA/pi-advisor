@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Advisor configuration now accepts an ordered `models` list and automatically falls back when a candidate is unavailable, errors, or returns an empty response. Legacy `provider`/`model` settings remain readable.
+- Added an opt-in, host-controlled read-only advisor tool loop for `read`, `grep`, `find`, and recorded `test_result` evidence. Calls are schema-validated, path-bounded, redacted, ledgered, timed out after 10 seconds, and capped at three per consultation; edit/write/bash remain unavailable.
 
 ### Fixed
 - Advisor calls now use Pi's `ModelRegistry.complete()` when available, so custom extension providers such as `anyrouter-messages` are dispatched through their registered runtime handler instead of the legacy global `completeSimple()` API registry. Older runtimes retain the compat fallback.

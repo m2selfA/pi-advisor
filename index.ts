@@ -11,7 +11,7 @@
  * The advisor:
  * - Sees a curated transcript plus the executor's current system prompt
  * - Returns strategic guidance (plan, correction, or stop signal)
- * - Cannot call tools — only provides text advice
+ * - May use a small, explicit, host-controlled read-only tool allowlist when enabled
  * - Is invoked at the executor's discretion
  *
  * Commands:
@@ -23,8 +23,16 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
-import { type Message, type TextContent, type ThinkingContent, type ThinkingLevel } from "@earendil-works/pi-ai";
-import { getAgentDir, keyHint, type ExtensionAPI, type ExtensionContext, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
+import {
+	type Message,
+	type TextContent,
+	type ThinkingContent,
+	type ThinkingLevel,
+	type Tool,
+	type ToolCall,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
+import { getAgentDir, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { buildAdvisorMessages } from "./src/advisor-messages.ts";
 import {
 	buildExecutorSignals,
@@ -42,12 +50,27 @@ import {
 	runWithAdvisorFallback,
 	type AdvisorModelRef,
 } from "./src/advisor-models.ts";
+import {
+	advisorToolDefinitions,
+	buildTestResultSummary,
+	DEFAULT_ADVISOR_TOOL_TIMEOUT_MS,
+	clampAdvisorToolResult,
+	isAdvisorToolName,
+	normalizeAdvisorTools,
+	parseAdvisorToolAllowlist,
+	validateAdvisorPath,
+	validateAdvisorToolArguments,
+	type AdvisorToolLedgerEntry,
+	type AdvisorToolName,
+	type AdvisorToolsConfig,
+} from "./src/advisor-tools.ts";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 interface AdvisorConfig {
 	enabled: boolean;
 	models: AdvisorModelRef[];
+	tools: AdvisorToolsConfig;
 	maxUsesPerRun: number;
 	maxTokens: number;
 	reasoning: ThinkingLevel;
@@ -55,8 +78,8 @@ interface AdvisorConfig {
 }
 
 interface AdvisorUsage {
-	inputTokens: number;
-	outputTokens: number;
+	inputTokens?: number;
+	outputTokens?: number;
 	model: string;
 }
 
@@ -65,6 +88,7 @@ interface AdvisorDetails {
 	callNumber: number;
 	stage?: AdvisorStage;
 	attemptedModels?: string[];
+	toolCalls?: AdvisorToolLedgerEntry[];
 	error?: string;
 	message?: string;
 }
@@ -72,6 +96,7 @@ interface AdvisorDetails {
 const DEFAULT_CONFIG: AdvisorConfig = {
 	enabled: false,
 	models: [{ provider: "anthropic", model: "claude-fable-5" }],
+	tools: normalizeAdvisorTools(undefined),
 	maxUsesPerRun: 3,
 	// Adaptive-thinking models count thinking tokens against the output cap;
 	// 8k left too little room for the actual advice at reasoning=high.
@@ -107,7 +132,7 @@ const ADVISOR_SYSTEM_PROMPT = `You are a senior engineering advisor. The executo
 Your role:
 - You see a curated subset of the executor's context: a truncated transcript, tool activity summaries (not full outputs), and its system prompt
 - If the evidence is too thin to judge, say so — never fill gaps with guesses
-- You cannot call tools or produce user-facing output
+- You cannot modify files, execute shell commands, or produce user-facing output; when an explicit read-only allowlist is present, use those investigative tools sparingly
 - Your advice directly shapes the executor's next actions
 
 What you provide depends on the stage:
@@ -132,6 +157,11 @@ function defaultConfig(): AdvisorConfig {
 	return {
 		...DEFAULT_CONFIG,
 		models: DEFAULT_CONFIG.models.map((model) => ({ ...model })),
+		tools: {
+			enabled: DEFAULT_CONFIG.tools.enabled,
+			allowlist: [...DEFAULT_CONFIG.tools.allowlist],
+			maxCalls: DEFAULT_CONFIG.tools.maxCalls,
+		},
 	};
 }
 
@@ -145,6 +175,7 @@ function loadConfig(): AdvisorConfig {
 		return {
 			enabled: typeof raw.enabled === "boolean" ? raw.enabled : fallback.enabled,
 			models: models.length > 0 ? models : fallback.models,
+			tools: normalizeAdvisorTools(raw.tools),
 			maxUsesPerRun: typeof raw.maxUsesPerRun === "number" ? raw.maxUsesPerRun : fallback.maxUsesPerRun,
 			maxTokens: typeof raw.maxTokens === "number" ? raw.maxTokens : fallback.maxTokens,
 			reasoning: VALID_REASONING_LEVELS.includes(raw.reasoning) ? raw.reasoning : fallback.reasoning,
@@ -217,7 +248,12 @@ function buildRecentToolActivity(events: RunToolEvent[]): string {
 
 // Stage specifics live in the final context message next to the freshest
 // evidence (see buildAdvisorMessages); the system prompt stays stage-agnostic.
-function buildAdvisorPrompt(executorSystemPrompt: string, activeToolsSummary: string): string {
+function buildAdvisorPrompt(
+	executorSystemPrompt: string,
+	activeToolsSummary: string,
+	advisorToolNames: readonly AdvisorToolName[] = [],
+	maxAdvisorToolCalls = 0,
+): string {
 	const trimmedSystemPrompt = executorSystemPrompt.trim();
 	const boundedSystemPrompt = trimmedSystemPrompt.length > MAX_SYSTEM_PROMPT_CHARS
 		? `${trimmedSystemPrompt.slice(0, MAX_SYSTEM_PROMPT_CHARS).trimEnd()}\n[executor system prompt truncated for advisor context]`
@@ -231,7 +267,11 @@ ${boundedSystemPrompt}
 SYSTEM_PROMPT>>>
 
 Active tools available to the executor:
-${activeToolsSummary}`;
+${activeToolsSummary}
+
+${advisorToolNames.length > 0
+		? `Advisor investigative tools available (read-only, host-controlled, max ${maxAdvisorToolCalls} calls):\n- ${advisorToolNames.join("\n- ")}\nUse them only when the transcript and recent evidence are insufficient. Never modify files, execute commands, or claim a test passed without recorded evidence.`
+		: "Advisor investigative tools are disabled for this consultation."}`;
 }
 
 function buildPreview(text: string, lines: number): { preview: string; truncated: boolean } {
@@ -274,6 +314,227 @@ function summarizeFallbackFailures(failures: Array<{ candidate: { ref: AdvisorMo
 		.join("; ");
 }
 
+type AdvisorToolExecution = {
+	text: string;
+	ledger: AdvisorToolLedgerEntry;
+};
+
+function toolResultText(content: Array<{ type?: string; text?: string }>): string {
+	return content
+		.filter((block) => block.type === "text" && typeof block.text === "string")
+		.map((block) => block.text ?? "")
+		.join("\n")
+		.trim();
+}
+
+function availableAdvisorToolNames(ctx: ExtensionToolContext, tools: AdvisorToolsConfig): AdvisorToolName[] {
+	const hostTools = new Set(ctx.tools.map((tool) => tool.name));
+	return tools.allowlist.filter((name) => name === "test_result" || hostTools.has(name));
+}
+
+async function executeAdvisorToolCall(
+	ctx: ExtensionToolContext,
+	call: ToolCall,
+	advisorTools: readonly Tool[],
+	runToolEvents: readonly RunToolEvent[],
+	signal: AbortSignal | undefined,
+	timeoutMs = DEFAULT_ADVISOR_TOOL_TIMEOUT_MS,
+): Promise<AdvisorToolExecution> {
+	const startedAt = Date.now();
+	const name = call.name;
+	const makeLedger = (status: AdvisorToolLedgerEntry["status"], text: string, error?: string): AdvisorToolExecution => ({
+		text: clampAdvisorToolResult(text),
+		ledger: {
+			name,
+			status,
+			durationMs: Date.now() - startedAt,
+			resultChars: text.length,
+			error: error ? redactAdvisorError(error) : undefined,
+		},
+	});
+
+	if (!isAdvisorToolName(name)) return makeLedger("blocked", `Tool ${name} is not allowed for advisor access.`, "tool not allowlisted");
+	const argumentError = validateAdvisorToolArguments(advisorTools, name, call.arguments);
+	if (argumentError) return makeLedger("blocked", `Advisor rejected ${name}: ${argumentError}.`, argumentError);
+	if (name === "test_result") return makeLedger("ok", buildTestResultSummary(runToolEvents));
+
+	const args = call.arguments as Record<string, unknown>;
+	const pathValues = [
+		typeof args.path === "string" ? args.path : undefined,
+		name === "grep" && typeof args.glob === "string" ? args.glob : undefined,
+		name === "find" && typeof args.pattern === "string" ? args.pattern : undefined,
+	].filter((value): value is string => Boolean(value));
+	for (const pathValue of pathValues) {
+		const pathError = validateAdvisorPath(ctx.cwd, pathValue);
+		if (pathError) return makeLedger("blocked", `Advisor access blocked: ${pathError}.`, pathError);
+	}
+	if (!ctx.tools.some((tool) => tool.name === name)) {
+		return makeLedger("error", `Host tool ${name} is unavailable in this session.`, "host tool unavailable");
+	}
+
+	const controller = new AbortController();
+	let timedOut = false;
+	let timeoutId: ReturnType<typeof setTimeout> | undefined;
+	let removeParentAbort: (() => void) | undefined;
+	const parentAbortPromise = signal
+		? new Promise<never>((_, reject) => {
+			const onAbort = () => {
+				controller.abort();
+				reject(new Error("Advisor call aborted"));
+			};
+			if (signal.aborted) onAbort();
+			else {
+				signal.addEventListener("abort", onAbort, { once: true });
+				removeParentAbort = () => signal.removeEventListener("abort", onAbort);
+			}
+		})
+		: undefined;
+	const timeoutPromise = new Promise<never>((_, reject) => {
+		timeoutId = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+			reject(new Error(`host tool timed out after ${timeoutMs}ms`));
+		}, timeoutMs);
+	});
+
+	try {
+		const executionPromise = ctx.executeTool(name, args, { signal: controller.signal });
+		const outcome = parentAbortPromise
+			? await Promise.race([executionPromise, timeoutPromise, parentAbortPromise])
+			: await Promise.race([executionPromise, timeoutPromise]);
+		const text = toolResultText(outcome.result.content);
+		const error = outcome.isError || outcome.result.isError;
+		return makeLedger(error ? "error" : "ok", text || (error ? "Host tool returned an error without details." : "Host tool returned no text."), error ? "host tool execution failed" : undefined);
+	} catch (error) {
+		const message = timedOut ? `host tool timed out after ${timeoutMs}ms` : error instanceof Error ? error.message : String(error);
+		return makeLedger("error", `Host tool ${name} failed: ${redactAdvisorError(message)}`, message);
+	} finally {
+		if (timeoutId !== undefined) clearTimeout(timeoutId);
+		removeParentAbort?.();
+	}
+}
+
+export type AdvisorCandidate = {
+	ref: AdvisorModelRef;
+	model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>;
+};
+
+type AdvisorCallResult = {
+	response: RegistryAssistantMessage;
+	finalText: string;
+	usage: AdvisorUsage;
+	toolCalls: AdvisorToolLedgerEntry[];
+};
+
+export async function completeAdvisorCandidate(
+	ctx: ExtensionToolContext,
+	candidate: AdvisorCandidate,
+	advisorPrompt: string,
+	initialMessages: Message[],
+	advisorTools: Tool[],
+	maxToolCalls: number,
+	maxTokens: number,
+	reasoning: ThinkingLevel,
+	runToolEvents: readonly RunToolEvent[],
+	signal: AbortSignal | undefined,
+	toolTimeoutMs = DEFAULT_ADVISOR_TOOL_TIMEOUT_MS,
+): Promise<AdvisorCallResult> {
+	const messages = [...initialMessages];
+	const ledger: AdvisorToolLedgerEntry[] = [];
+	let remainingToolCalls = maxToolCalls;
+	let forcedFinalRequest = false;
+	let inputTokens = 0;
+	let outputTokens = 0;
+	let inputUsageKnown = true;
+	let outputUsageKnown = true;
+
+	for (let requestNumber = 0; requestNumber <= maxToolCalls + 1; requestNumber++) {
+		if (signal?.aborted) throw new Error("Advisor call aborted");
+
+		const toolsForRequest = remainingToolCalls > 0 ? advisorTools : [];
+		const response = await completeThroughRegistry(
+			ctx,
+			candidate.model,
+			{
+				systemPrompt: advisorPrompt,
+				messages,
+				...(toolsForRequest.length > 0 ? { tools: toolsForRequest } : {}),
+			},
+			{
+				maxTokens,
+				signal,
+				reasoning,
+				sessionId: `${ctx.sessionManager.getSessionId()}:advisor:${encodeURIComponent(formatAdvisorModel(candidate.ref))}`,
+				...(toolsForRequest.length > 0 ? { toolChoice: "auto" as const } : {}),
+			},
+		);
+
+		if (typeof response.usage?.input === "number") inputTokens += response.usage.input;
+		else inputUsageKnown = false;
+		if (typeof response.usage?.output === "number") outputTokens += response.usage.output;
+		else outputUsageKnown = false;
+		if (response.errorMessage) throw new Error(`model error: ${response.errorMessage}`);
+
+		const toolCalls = response.content.filter((block): block is ToolCall => block.type === "toolCall");
+		const textBlocks = response.content.filter((block): block is TextContent => block.type === "text");
+		const thinkingBlocks = response.content.filter((block): block is ThinkingContent => block.type === "thinking");
+		const adviceText = textBlocks.map((block) => block.text).join("\n").trim();
+		const thinkingText = thinkingBlocks.map((block) => block.thinking).join("\n").trim();
+		const finalText = adviceText || (thinkingText ? `(thinking)\n${thinkingText}` : "");
+
+		if (toolCalls.length === 0) {
+			if (!finalText) throw new Error(`empty response (stop: ${response.stopReason})`);
+			return {
+				response,
+				finalText,
+				usage: {
+					inputTokens: inputUsageKnown ? inputTokens : undefined,
+					outputTokens: outputUsageKnown ? outputTokens : undefined,
+					model: formatAdvisorModel(candidate.ref),
+				},
+				toolCalls: ledger,
+			};
+		}
+
+		if (forcedFinalRequest) throw new Error("advisor tool loop exceeded its final-response budget");
+		messages.push(response);
+		if (remainingToolCalls === 0) forcedFinalRequest = true;
+
+		for (const call of toolCalls) {
+			let resultText: string;
+			let isError = false;
+			if (remainingToolCalls <= 0) {
+				resultText = "Advisor tool-call budget exhausted. Provide the final assessment without requesting more tools.";
+				isError = true;
+				ledger.push({
+					name: call.name,
+					status: "budget",
+					durationMs: 0,
+					resultChars: resultText.length,
+					error: "tool-call budget exhausted",
+				});
+			} else {
+				remainingToolCalls--;
+				const execution = await executeAdvisorToolCall(ctx, call, advisorTools, runToolEvents, signal, toolTimeoutMs);
+				resultText = execution.text;
+				isError = execution.ledger.status !== "ok";
+				ledger.push(execution.ledger);
+			}
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: resultText }],
+				isError,
+				timestamp: Date.now(),
+			};
+			messages.push(toolResult);
+		}
+	}
+
+	throw new Error("advisor tool loop exceeded its request budget");
+}
+
 export default function advisorExtension(pi: ExtensionAPI) {
 	let config = loadConfig();
 	let usesThisRun = 0;
@@ -288,7 +549,7 @@ export default function advisorExtension(pi: ExtensionAPI) {
 	// tool_result carries the tool input and typed details directly, so no
 	// tool_execution_start/end bookkeeping is needed.
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName === "advisor") return;
+		if (event.toolName === "advisor" || event.parentToolCallId) return;
 		runToolEvents.push(summarizeToolResult(event));
 
 		const hint = shouldNudge(runToolEvents, usesThisRun, config.enabled, config.maxUsesPerRun);
@@ -317,7 +578,7 @@ export default function advisorExtension(pi: ExtensionAPI) {
 		name: "advisor",
 		label: "Consult advisor",
 		description: `Consult a stronger model for strategic guidance. Returns a verdict (On track / Course-correct / Not done yet) plus numbered action items.
-The advisor sees the conversation transcript, your system prompt, and recent tool activity. It cannot call tools.`,
+The advisor sees the conversation transcript, your system prompt, and recent tool activity. Read-only investigative tools are opt-in via advisor.json and are host-controlled.`,
 		promptSnippet: "advisor({ stage? }): consult stronger model (ordered model fallbacks) for strategic guidance → verdict + action items",
 		promptGuidelines: [
 			"Call advisor({ stage: 'initial' }) for non-trivial tasks after 2-3 reads, before committing to an approach",
@@ -346,9 +607,6 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 				ref,
 				model: ctx.modelRegistry.find(ref.provider, ref.model),
 			}));
-			type AdvisorCandidate = (typeof configuredCandidates)[number] & {
-				model: NonNullable<(typeof configuredCandidates)[number]["model"]>;
-			};
 			const availableCandidates = configuredCandidates.filter(
 				(candidate): candidate is AdvisorCandidate => Boolean(candidate.model),
 			);
@@ -386,16 +644,18 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 			}
 
 			const executorSystemPrompt = ctx.getSystemPrompt();
-			const advisorPrompt = buildAdvisorPrompt(executorSystemPrompt, buildActiveToolsSummary(pi));
+			const advisorToolNames = config.tools.enabled ? availableAdvisorToolNames(ctx, config.tools) : [];
+			const advisorTools = config.tools.enabled ? advisorToolDefinitions(advisorToolNames) : [];
+			const advisorPrompt = buildAdvisorPrompt(
+				executorSystemPrompt,
+				buildActiveToolsSummary(pi),
+				advisorToolNames,
+				config.tools.maxCalls,
+			);
 
 			// Count one advisor consultation, not one count per fallback candidate.
 			usesThisRun++;
 
-			type AdvisorCallResult = {
-				response: RegistryAssistantMessage;
-				finalText: string;
-				usage: AdvisorUsage;
-			};
 			let fallbackResult: Awaited<ReturnType<typeof runWithAdvisorFallback<AdvisorCandidate, AdvisorCallResult>>>;
 			try {
 				fallbackResult = await runWithAdvisorFallback<AdvisorCandidate, AdvisorCallResult>(availableCandidates, async (candidate) => {
@@ -406,47 +666,22 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 					}
 
 					try {
-						const response = await completeThroughRegistry(
+						const value = await completeAdvisorCandidate(
 							ctx,
-							candidate.model,
-							{
-								systemPrompt: advisorPrompt,
-								// Safe cast: assistant entries are spread from real AssistantMessages
-								// (text-only content), synthetic entries are well-formed UserMessages.
-								messages: advisorMessages as Message[],
-							},
-							{
-								maxTokens: config.maxTokens,
-								signal,
-								reasoning: config.reasoning,
-								// Keep cache affinity stable per advisor model. A fallback model
-								// must not inherit a failed candidate's provider-side cache.
-								sessionId: `${ctx.sessionManager.getSessionId()}:advisor:${encodeURIComponent(formatAdvisorModel(candidate.ref))}`,
-							},
+							candidate,
+							advisorPrompt,
+							advisorMessages as Message[],
+							advisorTools,
+							config.tools.enabled ? config.tools.maxCalls : 0,
+							config.maxTokens,
+							config.reasoning,
+							runToolEvents,
+							signal,
 						);
-
-						const textBlocks = response.content.filter((b): b is TextContent => b.type === "text");
-						const thinkingBlocks = response.content.filter((b): b is ThinkingContent => b.type === "thinking");
-						const adviceText = textBlocks.map((b) => b.text).join("\n").trim();
-						const thinkingText = thinkingBlocks.map((b) => b.thinking).join("\n").trim();
-						const finalText = adviceText || (thinkingText ? `(thinking)\n${thinkingText}` : "");
-						const usage: AdvisorUsage = {
-							inputTokens: response.usage?.input ?? 0,
-							outputTokens: response.usage?.output ?? 0,
-							model: formatAdvisorModel(candidate.ref),
-						};
-
-						if (response.errorMessage) {
-							return { ok: false, message: `model error: ${response.errorMessage}` };
-						}
-						if (!finalText) {
-							return { ok: false, message: `empty response (stop: ${response.stopReason})` };
-						}
-
-						return { ok: true, value: { response, finalText, usage } };
+						return { ok: true, value };
 					} catch (err) {
 						// Only the executor's cancellation signal stops fallback; provider-side
-						// AbortError/timeout failures remain eligible for the next model.
+						// AbortError/timeout/tool incompatibility failures remain eligible for the next model.
 						if (signal?.aborted) throw err;
 						const msg = err instanceof Error ? err.message : String(err);
 						return { ok: false, message: msg };
@@ -485,7 +720,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 				};
 			}
 
-			const { response, finalText, usage } = fallbackResult.value;
+			const { response, finalText, usage, toolCalls } = fallbackResult.value;
 			pi.appendEntry("advisor-usage", usage);
 
 			return {
@@ -495,6 +730,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 					callNumber: usesThisRun,
 					stage: stageInfo.stage,
 					attemptedModels: fallbackResult.attempted.map((candidate) => formatAdvisorModel(candidate.ref)),
+					toolCalls,
 				} as AdvisorDetails,
 				usage: response.usage,
 				isError: false,
@@ -535,11 +771,19 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 				}
 			}
 
+			if (details?.toolCalls && details.toolCalls.length > 0) {
+				container.addChild(new Spacer(1));
+				const toolSummary = details.toolCalls
+					.map((call) => `${call.name}:${call.status}`)
+					.join(", ");
+				container.addChild(new Text(theme.fg("dim", `Advisor tools (${details.toolCalls.length}): ${toolSummary}`), 0, 0));
+			}
+
 			if (details?.usage) {
 				container.addChild(new Spacer(1));
 				container.addChild(
 					new Text(
-						theme.fg("dim", `↑${formatTokens(details.usage.inputTokens)} ↓${formatTokens(details.usage.outputTokens)} ${details.usage.model}`),
+						theme.fg("dim", `↑${details.usage.inputTokens === undefined ? "unknown" : formatTokens(details.usage.inputTokens)} ↓${details.usage.outputTokens === undefined ? "unknown" : formatTokens(details.usage.outputTokens)} ${details.usage.model}`),
 						0,
 						0,
 					),
@@ -562,7 +806,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 
 			const parts = trimmed.split(/\s+/);
 			if (parts[0] === "config" && parts.length <= 2) {
-				const keys = ["models=", "provider=", "model=", "maxUsesPerRun=", "maxTokens=", "reasoning=", "maxContextMessages="];
+				const keys = ["models=", "provider=", "model=", "tools.enabled=", "tools.allowlist=", "tools.maxCalls=", "maxUsesPerRun=", "maxTokens=", "reasoning=", "maxContextMessages="];
 				const lastPart = parts[parts.length - 1] ?? "";
 				const matches = keys.filter((k) => k.startsWith(lastPart));
 				return matches.length > 0 ? matches.map((k) => ({ value: `config ${k}`, label: k })) : null;
@@ -615,6 +859,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 							"",
 							`  Status:       ${status}`,
 							`  Models:       ${configuredModelsText(config)}`,
+							`  Tools:        ${config.tools.enabled ? "enabled" : "disabled"} (${config.tools.allowlist.join(", ")}; max ${config.tools.maxCalls} calls)`,
 							`  Max uses/run: ${config.maxUsesPerRun}`,
 							`  Max tokens:   ${config.maxTokens}`,
 							`  Reasoning:    ${config.reasoning}`,
@@ -626,14 +871,14 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 							"  /advisor config key=value       Set config value",
 							"  /advisor ask                    Trigger consultation",
 							"",
-							"Config keys: models, provider, model, maxUsesPerRun, maxTokens, reasoning, maxContextMessages; models accepts provider/model,provider/model,...",
+							"Config keys: models, provider, model, tools.enabled, tools.allowlist, tools.maxCalls, maxUsesPerRun, maxTokens, reasoning, maxContextMessages; tools are read-only and disabled by default.",
 							`Reasoning levels: ${VALID_REASONING_LEVELS.join(", ")}`,
 						];
 						notify(ctx, lines.join("\n"), "info");
 						return;
 					}
 
-					const match = rest.match(/^(\w+)=(.+)$/);
+					const match = rest.match(/^([A-Za-z][A-Za-z0-9_.-]*)=(.+)$/);
 					if (!match) {
 						notify(ctx, "Invalid format. Use: /advisor config key=value", "warning");
 						return;
@@ -658,6 +903,32 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 						case "model": {
 							const first = config.models[0] ?? DEFAULT_CONFIG.models[0];
 							config.models = [{ provider: first.provider, model: value.trim() }, ...config.models.slice(1)];
+							break;
+						}
+						case "tools.enabled": {
+							if (value !== "true" && value !== "false") {
+								notify(ctx, "tools.enabled must be true or false", "warning");
+								return;
+							}
+							config.tools.enabled = value === "true";
+							break;
+						}
+						case "tools.allowlist": {
+							const allowlist = parseAdvisorToolAllowlist(value);
+							if (allowlist.length === 0) {
+								notify(ctx, "tools.allowlist must contain read, grep, find, or test_result", "warning");
+								return;
+							}
+							config.tools.allowlist = allowlist;
+							break;
+						}
+						case "tools.maxCalls": {
+							const num = Number.parseInt(value, 10);
+							if (Number.isNaN(num) || num < 1 || num > 3) {
+								notify(ctx, "tools.maxCalls must be an integer from 1 to 3", "warning");
+								return;
+							}
+							config.tools.maxCalls = num;
 							break;
 						}
 						case "maxUsesPerRun": {
@@ -696,7 +967,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 							break;
 						}
 						default:
-							notify(ctx, "Unknown config key. Valid keys: models, provider, model, maxUsesPerRun, maxTokens, reasoning, maxContextMessages", "warning");
+							notify(ctx, "Unknown config key. Valid keys: models, provider, model, tools.enabled, tools.allowlist, tools.maxCalls, maxUsesPerRun, maxTokens, reasoning, maxContextMessages", "warning");
 							return;
 					}
 
@@ -724,6 +995,7 @@ The advisor sees the conversation transcript, your system prompt, and recent too
 					const lines = [
 						`Advisor: ${status}`,
 						`Models:    ${configuredModelsText(config)}`,
+						`Tools:     ${config.tools.enabled ? "enabled" : "disabled"} (${config.tools.allowlist.join(", ")}; max ${config.tools.maxCalls})`,
 						`Reasoning: ${config.reasoning}`,
 						"",
 						"Commands:",
